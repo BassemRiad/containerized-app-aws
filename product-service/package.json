@@ -1,0 +1,13 @@
+{
+  "name": "product-service",
+  "version": "1.0.0",
+  "description": "Product catalog microservice backed by Amazon RDS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mysql2": "^3.11.0"
+  }
+}

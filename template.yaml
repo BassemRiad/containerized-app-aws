@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Project 5 — Containerized Application. Starts with just the network
+  and database tier (VPC + RDS) so the product-service container has
+  something real to connect to; ECR/ECS/ALB are added in later steps.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: containerized-app-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private subnets intentionally have no route to the internet — the
+  # product-service containers will reach the internet (to pull their
+  # image, send logs, etc.) through ECS/Fargate's own networking in a
+  # later step, not through a NAT Gateway we'd be paying for right now.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the product database
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL only from inside the VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.1.0.0/16
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Master password for the product-service RDS instance
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "productadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\'
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: containerized-app-db
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      DBName: productdb
+      MasterUsername: productadmin
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+      PubliclyAccessible: false
+
+  # Image registry for the product-service container. Pushed to by
+  # hand for now (this step), by CodeBuild once the CI/CD pipeline
+  # exists later on.
+  ProductServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: product-service
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: product-service-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # Container instances get no inbound rule at all right now — nothing
+  # needs to reach them directly yet. The next exercise adds an ALB,
+  # which will get its own rule to reach containers on their dynamic
+  # host ports.
+  ECSInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS container instances - no direct inbound access
+      VpcId: !Ref VPC
+
+  ECSInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ECSInstanceRole
+
+  # The compute capacity tasks actually land on. Fixed at 2 instances
+  # across both AZs for now — "Replace EC2 with Fargate" is a later
+  # optimization step, not something to pre-empt here.
+  ECSLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: product-service-ecs-instance
+      LaunchTemplateData:
+        InstanceType: t3.micro
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id}}"
+        SecurityGroupIds:
+          - !Ref ECSInstanceSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt ECSInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+
+  ECSCapacity:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: product-service-ecs-capacity
+      MinSize: "2"
+      MaxSize: "2"
+      DesiredCapacity: "2"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchTemplate
+        Version: !GetAtt ECSLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+
+  ProductServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/product-service
+      RetentionInDays: 14
+
+  # Pulls the image from ECR and writes container logs to CloudWatch —
+  # the task's own permissions, separate from what the EC2 host itself
+  # can do.
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ProductServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: product-service
+      RequiresCompatibilities:
+        - EC2
+      NetworkMode: bridge
+      Cpu: "256"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: product-service
+          Image: !Sub "${ProductServiceRepository.RepositoryUri}:latest"
+          PortMappings:
+            - ContainerPort: 3000
+              # No fixed HostPort: Docker picks a free ephemeral port
+              # per task, so more than one task can run per EC2
+              # instance. The ALB target group tracks the real
+              # instance:port pairs automatically through the Service.
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt DBInstance.Endpoint.Address
+            - Name: DB_USER
+              Value: productadmin
+            - Name: DB_NAME
+              Value: productdb
+            - Name: DB_PASSWORD
+              Value: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProductServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP in from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Dynamic host ports mean we don't know ahead of time which port a
+  # task will land on, so the ALB needs the whole ephemeral range
+  # rather than a single port — scoped to only the ALB's own security
+  # group as the source, not the open internet.
+  ECSInstanceIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 32768
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: product-service-alb
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: product-service-tg
+      Port: 3000
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ProductServiceService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: product-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ProductServiceTaskDefinition
+      DesiredCount: 2
+      LaunchType: EC2
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+      LoadBalancers:
+        - ContainerName: product-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+  ServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${ECSCluster}/${ProductServiceService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: 2
+      MaxCapacity: 4
+
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: product-service-cpu-target-tracking
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: product-service-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ECS Cluster - CPU / Memory Reservation",
+                "metrics": [
+                  [ "AWS/ECS", "CPUReservation", "ClusterName", "${ECSCluster}" ],
+                  [ "AWS/ECS", "MemoryReservation", "ClusterName", "${ECSCluster}" ]
+                ],
+                "stat": "Average", "period": 60, "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "product-service - Desired vs Running Tasks",
+                "metrics": [
+                  [ "ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", "${ECSCluster}", "ServiceName", "${ProductServiceService.Name}" ],
+                  [ "ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${ECSCluster}", "ServiceName", "${ProductServiceService.Name}" ]
+                ],
+                "stat": "Average", "period": 60, "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "ALB - Request Count",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                ],
+                "stat": "Sum", "period": 60, "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "ALB - 4XX Errors (target + ELB)",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
+                  [ "AWS/ApplicationELB", "HTTPCode_ELB_4XX_Count", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                ],
+                "stat": "Sum", "period": 60, "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  LoadBalancerUrl:
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  ECSClusterName:
+    Value: !Ref ECSCluster
+  ProductServiceTaskDefinitionArn:
+    Value: !Ref ProductServiceTaskDefinition
+  ProductServiceRepositoryUri:
+    Value: !GetAtt ProductServiceRepository.RepositoryUri
+  VpcId:
+    Value: !Ref VPC
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+  DBEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+  DBSecretArn:
+    Value: !Ref DBSecret
