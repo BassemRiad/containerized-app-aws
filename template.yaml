@@ -671,6 +671,15 @@ Resources:
                   - !Sub "arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${CodeDeployApplication}"
                   - !Sub "arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${CodeDeployApplication}/${CodeDeployDeploymentGroup}"
                   - !Sub "arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*"
+              # The CodeDeployToECS pipeline action registers the new
+              # task definition revision itself (not just CodeDeploy's
+              # own service role), so the pipeline role needs this too.
+              - Effect: Allow
+                Action: ecs:RegisterTaskDefinition
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ECSTaskExecutionRole.Arn
 
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
