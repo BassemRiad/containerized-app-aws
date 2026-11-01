@@ -15,12 +15,7 @@ phases:
       - echo Pushing the Docker image...
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - printf '{"ImageURI":"%s"}' "$REPOSITORY_URI:$IMAGE_TAG" > imageDetail.json
-      - >
-        sed -e "s|<TASK_EXEC_ROLE_ARN>|$TASK_EXEC_ROLE_ARN|g"
-            -e "s|<DB_HOST>|$DB_HOST|g"
-            -e "s|<DB_SECRET_ARN>|$DB_SECRET_ARN|g"
-            -e "s|<AWS_REGION>|$AWS_DEFAULT_REGION|g"
-            taskdef-template.json > taskdef.json
+      - sed -e "s|<TASK_EXEC_ROLE_ARN>|$TASK_EXEC_ROLE_ARN|g" -e "s|<DB_HOST>|$DB_HOST|g" -e "s|<DB_SECRET_ARN>|$DB_SECRET_ARN|g" -e "s|<AWS_REGION>|$AWS_DEFAULT_REGION|g" taskdef-template.json > taskdef.json
       - cat taskdef.json
 
 artifacts:
