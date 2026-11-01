@@ -498,7 +498,7 @@ Resources:
   GitHubConnection:
     Type: AWS::CodeStarConnections::Connection
     Properties:
-      ConnectionName: containerized-app-github
+      ConnectionName: containerized-app-github-v2
       ProviderType: GitHub
 
   CodeBuildServiceRole:
