@@ -1,9 +1,9 @@
 {
   "family": "product-service",
-  "networkMode": "bridge",
-  "requiresCompatibilities": ["EC2"],
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
-  "memory": "256",
+  "memory": "512",
   "executionRoleArn": "<TASK_EXEC_ROLE_ARN>",
   "containerDefinitions": [
     {

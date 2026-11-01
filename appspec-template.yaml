@@ -1,0 +1,15 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: "product-service"
+          ContainerPort: 3000
+        PlatformVersion: "LATEST"
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            Subnets: ["<PUBLIC_SUBNET_1>", "<PUBLIC_SUBNET_2>"]
+            SecurityGroups: ["<FARGATE_SG>"]
+            AssignPublicIp: ENABLED

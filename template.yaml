@@ -181,68 +181,25 @@ Resources:
       ClusterSettings:
         - Name: containerInsights
           Value: enabled
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
 
-  # Container instances get no inbound rule at all right now — nothing
-  # needs to reach them directly yet. The next exercise adds an ALB,
-  # which will get its own rule to reach containers on their dynamic
-  # host ports.
-  ECSInstanceSecurityGroup:
+  # Fargate tasks run in awsvpc mode — each task gets its own ENI in
+  # one of the public subnets (no NAT Gateway in this project), so
+  # this security group replaces the old EC2 instance SG + ephemeral
+  # port range entirely. Only the ALB can reach the container's real
+  # port directly.
+  ECSFargateTaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ECS container instances - no direct inbound access
+      GroupDescription: product-service Fargate tasks - inbound only from the ALB
       VpcId: !Ref VPC
-
-  ECSInstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
-
-  ECSInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      Roles:
-        - !Ref ECSInstanceRole
-
-  # The compute capacity tasks actually land on. Fixed at 2 instances
-  # across both AZs for now — "Replace EC2 with Fargate" is a later
-  # optimization step, not something to pre-empt here.
-  ECSLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateName: product-service-ecs-instance
-      LaunchTemplateData:
-        InstanceType: t3.micro
-        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id}}"
-        SecurityGroupIds:
-          - !Ref ECSInstanceSecurityGroup
-        IamInstanceProfile:
-          Arn: !GetAtt ECSInstanceProfile.Arn
-        UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
-
-  ECSCapacity:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      AutoScalingGroupName: product-service-ecs-capacity
-      MinSize: "2"
-      MaxSize: "2"
-      DesiredCapacity: "2"
-      LaunchTemplate:
-        LaunchTemplateId: !Ref ECSLaunchTemplate
-        Version: !GetAtt ECSLaunchTemplate.LatestVersionNumber
-      VPCZoneIdentifier:
-        - !Ref PublicSubnet
-        - !Ref PublicSubnet2
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
 
   ProductServiceLogGroup:
     Type: AWS::Logs::LogGroup
@@ -279,20 +236,17 @@ Resources:
     Properties:
       Family: product-service
       RequiresCompatibilities:
-        - EC2
-      NetworkMode: bridge
+        - FARGATE
+      NetworkMode: awsvpc
       Cpu: "256"
-      Memory: "256"
+      Memory: "512"
       ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: product-service
           Image: !Sub "${ProductServiceRepository.RepositoryUri}:latest"
           PortMappings:
             - ContainerPort: 3000
-              # No fixed HostPort: Docker picks a free ephemeral port
-              # per task, so more than one task can run per EC2
-              # instance. The ALB target group tracks the real
-              # instance:port pairs automatically through the Service.
+              Protocol: tcp
           Environment:
             - Name: DB_HOST
               Value: !GetAtt DBInstance.Endpoint.Address
@@ -321,19 +275,6 @@ Resources:
           ToPort: 80
           CidrIp: 0.0.0.0/0
 
-  # Dynamic host ports mean we don't know ahead of time which port a
-  # task will land on, so the ALB needs the whole ephemeral range
-  # rather than a single port — scoped to only the ALB's own security
-  # group as the source, not the open internet.
-  ECSInstanceIngressFromALB:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref ECSInstanceSecurityGroup
-      IpProtocol: tcp
-      FromPort: 32768
-      ToPort: 65535
-      SourceSecurityGroupId: !Ref ALBSecurityGroup
-
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -344,13 +285,17 @@ Resources:
       SecurityGroups:
         - !Ref ALBSecurityGroup
 
+  # TargetType: ip — Fargate tasks in awsvpc mode don't have an EC2
+  # instance ID to register, only the ENI's own IP. Renamed (not just
+  # retyped) so CloudFormation can create these before deleting the
+  # old instance-type groups, instead of colliding on name.
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: product-service-tg
+      Name: product-service-tg-fg
       Port: 3000
       Protocol: HTTP
-      TargetType: instance
+      TargetType: ip
       VpcId: !Ref VPC
       HealthCheckPath: /health
       HealthCheckIntervalSeconds: 15
@@ -364,10 +309,10 @@ Resources:
   TargetGroupGreen:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: product-service-tg-green
+      Name: product-service-tg-fg-green
       Port: 3000
       Protocol: HTTP
-      TargetType: instance
+      TargetType: ip
       VpcId: !Ref VPC
       HealthCheckPath: /health
       HealthCheckIntervalSeconds: 15
@@ -384,23 +329,45 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
+  # Renamed (not just updated in place) because once a service is on
+  # the CODE_DEPLOY controller, ECS permanently refuses to let
+  # CloudFormation change its TaskDefinition — all further task def
+  # changes have to go through CodeDeploy. Recreating under a new
+  # name sidesteps that: it's a brand-new service created from
+  # scratch with the Fargate task definition from day one, not an
+  # update to the old EC2/bridge one.
   ProductServiceService:
     Type: AWS::ECS::Service
     DependsOn: ALBListener
     Properties:
-      ServiceName: product-service
+      ServiceName: product-service-fargate
       Cluster: !Ref ECSCluster
       TaskDefinition: !Ref ProductServiceTaskDefinition
       DesiredCount: 2
-      LaunchType: EC2
       # CODE_DEPLOY hands control of task placement and traffic
       # shifting to CodeDeploy's blue/green deployments (set up below)
       # instead of ECS's own rolling-update logic.
       DeploymentController:
         Type: CODE_DEPLOY
-      PlacementStrategies:
-        - Type: spread
-          Field: attribute:ecs.availability-zone
+      # Baseline of 2 tasks always on regular FARGATE (steady,
+      # non-interruptible); anything ECS scales beyond that baseline
+      # (weight-only, no base) lands on FARGATE_SPOT instead, since
+      # the extra scale-out capacity is the part most worth saving on.
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Base: 2
+          Weight: 0
+        - CapacityProvider: FARGATE_SPOT
+          Base: 0
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ECSFargateTaskSecurityGroup
+          AssignPublicIp: ENABLED
       LoadBalancers:
         - ContainerName: product-service
           ContainerPort: 3000
@@ -568,6 +535,12 @@ Resources:
             Value: !GetAtt DBInstance.Endpoint.Address
           - Name: DB_SECRET_ARN
             Value: !Ref DBSecret
+          - Name: PUBLIC_SUBNET_1
+            Value: !Ref PublicSubnet
+          - Name: PUBLIC_SUBNET_2
+            Value: !Ref PublicSubnet2
+          - Name: FARGATE_SG
+            Value: !Ref ECSFargateTaskSecurityGroup
 
   CodeDeployServiceRole:
     Type: AWS::IAM::Role
